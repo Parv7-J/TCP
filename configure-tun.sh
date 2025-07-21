@@ -1,19 +1,15 @@
 #!/bin/bash
 
-# This command makes the script exit immediately if any command fails.
 set -e
 
-# --- Configuration ---
 DEVICE="tun0"
 IP_ADDRESS="10.0.0.1/24"
-# ---------------------
 
-echo "Configuring device: $DEVICE"
+sysctl -w net.ipv6.conf.$DEVICE.disable_ipv6=1
 
-# 1. Bring the network interface online.
 ip link set dev $DEVICE up
+# echo "$DEVICE is up for communication, ipv6 is set by default"
+echo "$DEVICE is up for communication, ipv6 has been disabled"
 
-# 2. Assign the IP address to the interface.
 ip addr add $IP_ADDRESS dev $DEVICE
-
-echo "Device $DEVICE configured successfully with IP $IP_ADDRESS"
+echo "$DEVICE got ipv4 $IP_ADDRESS"
