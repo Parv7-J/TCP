@@ -108,12 +108,115 @@ fn main() -> io::Result<()> {
                         tun_file.write_all(&pckt)?
                     };
                 }
-                _ => {}
+                RequestType::FIN => {
+                    if let Some(pckt) = handle_fin(&packet, &segment, &mut connections) {
+                        tun_file.write_all(&pckt)?
+                    };
+                }
+                RequestType::FINACK => {
+                    if let Some(pckt) = handle_finack(&packet, &segment, &mut connections) {
+                        tun_file.write_all(&pckt)?
+                    };
+                }
+                i => {
+                    println!("{i:?}");
+                }
             }
         }
     }
 
     return cleanup(tunif_name);
+}
+
+fn handle_finack(
+    packet: &Packet,
+    segment: &Segment,
+    connections: &mut HashMap<(u32, u16, u32, u16), Connection>,
+) -> Option<[u8; 40]> {
+    let key = (
+        packet.source_address,
+        segment.source_port,
+        packet.destination_address,
+        segment.destination_port,
+    );
+
+    if let Some(connection) = connections.get_mut(&key) {
+        match connection.state {
+            State::Established => {
+                println!("Requested a closure");
+                if segment.sequence_number == connection.recv_next {
+                    println!("Matched");
+                    // connection.send_next += 1;
+                    connection.recv_next += 1;
+
+                    let tcp_header = match Segment::build(&connection, RequestType::FINACK) {
+                        Ok(header) => header,
+                        Err(_) => {
+                            println!("Checksum calc is not done correctly for segment");
+                            return None;
+                        }
+                    };
+
+                    let ip_packet = match Packet::build(tcp_header, &connection) {
+                        Ok(packet) => packet,
+                        Err(_) => {
+                            println!("Checksum calc is not done correctly for packet");
+                            return None;
+                        }
+                    };
+                    connection.state = State::LastAck;
+                    return Some(ip_packet);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    return None;
+}
+
+fn handle_fin(
+    packet: &Packet,
+    segment: &Segment,
+    connections: &mut HashMap<(u32, u16, u32, u16), Connection>,
+) -> Option<[u8; 40]> {
+    let key = (
+        packet.source_address,
+        segment.source_port,
+        packet.destination_address,
+        segment.destination_port,
+    );
+
+    if let Some(connection) = connections.get_mut(&key) {
+        match connection.state {
+            State::Established => {
+                println!("Requested a closure");
+                if segment.sequence_number == connection.recv_next {
+                    println!("Matched");
+                    let tcp_header = match Segment::build(&connection, RequestType::ACK) {
+                        Ok(header) => header,
+                        Err(_) => {
+                            println!("Checksum calc is not done correctly for segment");
+                            return None;
+                        }
+                    };
+
+                    let ip_packet = match Packet::build(tcp_header, &connection) {
+                        Ok(packet) => packet,
+                        Err(_) => {
+                            println!("Checksum calc is not done correctly for packet");
+                            return None;
+                        }
+                    };
+                    connection.state = State::CloseWait;
+                    return Some(ip_packet);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    return None;
 }
 
 fn handle_syn(
@@ -182,6 +285,7 @@ fn handle_ack(
             State::SynRcvd => {
                 if segment.acknowledgement_number == connection.send_next {
                     println!("Connection ESTABLISHED!");
+                    connection.send_next += 1;
                     connection.state = State::Established;
                 } else {
                     println!("Received ACK with wrong number for a connection in SYN_RCVD.");
@@ -190,6 +294,11 @@ fn handle_ack(
             State::Established => {
                 println!("Established connection is sending an ack");
                 //we will send some packet here
+            }
+            State::LastAck => {
+                println!("Last , goodbye my friend");
+                connection.state = State::Closed;
+                println!("{connection:?}");
             }
             _ => {}
         }
@@ -226,7 +335,6 @@ fn handle_pshack(
                     }
 
                     connection.recv_next += data_length as u32;
-                    connection.send_next += 1;
 
                     let tcp_header = match Segment::build(&connection, RequestType::ACK) {
                         Ok(header) => header,

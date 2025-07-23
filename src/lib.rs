@@ -1,8 +1,13 @@
 use std::{fmt, io};
 
+pub const FIN_FLAG: u8 = 0b0000_0001;
 pub const SYN_FLAG: u8 = 0b0000_0010;
-pub const ACK_FLAG: u8 = 0b0001_0000;
+pub const RST_FLAG: u8 = 0b0000_0100;
 pub const PSH_FLAG: u8 = 0b0000_1000;
+pub const ACK_FLAG: u8 = 0b0001_0000;
+pub const URG_FLAG: u8 = 0b0001_0000;
+pub const ECE_FLAG: u8 = 0b0001_0000;
+pub const CWR_FLAG: u8 = 0b0001_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
@@ -87,6 +92,9 @@ pub enum State {
     Listen,
     SynRcvd,
     Established,
+    CloseWait,
+    LastAck,
+    Closed,
 }
 
 impl fmt::Display for State {
@@ -106,12 +114,15 @@ pub struct Connection {
     pub recv_next: u32,
 }
 
+#[derive(Debug)]
 pub enum RequestType {
     SYN,
     ACK,
     PSHACK,
     FIN,
     SYNACK,
+    RST,
+    FINACK,
     Unknown(u8),
 }
 
@@ -203,7 +214,12 @@ impl Segment {
             return RequestType::ACK;
         } else if flags == PSH_FLAG | ACK_FLAG {
             return RequestType::PSHACK;
-        //also handle fin
+        } else if flags == FIN_FLAG {
+            return RequestType::FIN;
+        } else if flags == FIN_FLAG | ACK_FLAG {
+            return RequestType::FINACK;
+        } else if flags & RST_FLAG != 0 {
+            return RequestType::RST;
         } else {
             return RequestType::Unknown(flags);
         }
@@ -227,6 +243,7 @@ impl Segment {
         tcp_header[13] = match type_of_req {
             RequestType::ACK => ACK_FLAG,
             RequestType::SYNACK => SYN_FLAG | ACK_FLAG,
+            RequestType::FINACK => FIN_FLAG | ACK_FLAG,
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
