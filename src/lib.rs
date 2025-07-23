@@ -1,7 +1,8 @@
 use std::{fmt, io};
 
-const SYN_FLAG: u8 = 0b0000_0010;
-const ACK_FLAG: u8 = 0b0001_0000;
+pub const SYN_FLAG: u8 = 0b0000_0010;
+pub const ACK_FLAG: u8 = 0b0001_0000;
+pub const PSH_FLAG: u8 = 0b0000_1000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
@@ -108,6 +109,9 @@ pub struct Connection {
 pub enum RequestType {
     SYN,
     ACK,
+    PSHACK,
+    FIN,
+    SYNACK,
     Unknown(u8),
 }
 
@@ -193,17 +197,19 @@ impl Segment {
     }
 
     pub fn check_flags(flags: u8) -> RequestType {
-        //we right now only handle if syn and if ack
-        if ((flags >> 4) & 1 == 0) && ((flags >> 1) & 1 == 1) {
+        if flags == SYN_FLAG {
             return RequestType::SYN;
-        } else if ((flags >> 4) & 1 == 1) && ((flags >> 1) & 1 == 0) {
+        } else if flags == ACK_FLAG {
             return RequestType::ACK;
+        } else if flags == PSH_FLAG | ACK_FLAG {
+            return RequestType::PSHACK;
+        //also handle fin
         } else {
             return RequestType::Unknown(flags);
         }
     }
 
-    pub fn build(connection: &Connection) -> Result<[u8; 20], io::Error> {
+    pub fn build(connection: &Connection, type_of_req: RequestType) -> Result<[u8; 20], io::Error> {
         let mut tcp_header = [0u8; 20];
 
         tcp_header[0..2].copy_from_slice(&connection.destination_port.to_be_bytes());
@@ -218,7 +224,16 @@ impl Segment {
 
         tcp_header[12] = 5 << 4;
 
-        tcp_header[13] = SYN_FLAG | ACK_FLAG;
+        tcp_header[13] = match type_of_req {
+            RequestType::ACK => ACK_FLAG,
+            RequestType::SYNACK => SYN_FLAG | ACK_FLAG,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Wrong request type",
+                ));
+            }
+        };
 
         let window = (65535 as u16).to_be_bytes();
         tcp_header[14..16].copy_from_slice(&window);
@@ -336,11 +351,6 @@ impl Packet {
     }
 
     fn validate(packet_data: &[u8]) -> bool {
-        // let mut sum: u32 = 0;
-        // for i in packet_data.chunks_exact(2) {
-        //     sum += u16::from_be_bytes([i[0], i[1]]) as u32;
-        // }
-
         let header_length = (packet_data[0] & 0x0F) * 4;
         let ip_header = &packet_data[..header_length as usize];
 

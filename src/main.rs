@@ -50,44 +50,7 @@ fn main() -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    println!("TUN is established!");
-
-    Command::new("sudo")
-        .args([
-            "iptables",
-            "-I",
-            "INPUT",
-            "1",
-            "-i",
-            tunif_name,
-            "-p",
-            "tcp",
-            "--tcp-flags", // This is the new part
-            "SYN,RST,ACK,FIN",
-            "SYN", // This is the new part
-            "-j",
-            "DROP",
-        ])
-        .status()?;
-
-    Command::new("sudo")
-        .args([
-            "sysctl",
-            "-w",
-            &format!("net.ipv6.conf.{}.disable_ipv6=1", tunif_name),
-        ])
-        .stdout(Stdio::null())
-        .status()?;
-
-    Command::new("sudo")
-        .args(["ip", "link", "set", "dev", tunif_name, "up"])
-        .status()?;
-
-    Command::new("sudo")
-        .args(["ip", "addr", "add", tunif_address, "dev", { tunif_name }])
-        .status()?;
-
-    println!("TUN is configured!");
+    configure(tunif_name, tunif_address)?;
 
     let mut buff = [0u8; 2000];
 
@@ -113,8 +76,6 @@ fn main() -> io::Result<()> {
         let packet = Packet::parse(&buff[..n])?;
 
         if packet.protocol == Protocol::TCP {
-            println!("Hey tcp is here!!!");
-
             let length_of_ip_header = packet.ihl * 4;
             let length_of_segment = packet.total_length - length_of_ip_header as u16;
 
@@ -129,57 +90,48 @@ fn main() -> io::Result<()> {
 
             let segment = Segment::parse(&buff[length_of_ip_header as usize..n], pseudo_header)?;
 
-            // let segment_header_length = segment.data_offset * 4;
-
-            // let data_size = length_of_segment - segment_header_length as u16;
-
             let segment_type = Segment::check_flags(segment.flags);
 
             match segment_type {
                 RequestType::SYN => {
-                    if let Some(pckt) = hanlde_syn(&packet, &segment, &mut connections) {
+                    if let Some(pckt) = handle_syn(&packet, &segment, &mut connections) {
                         tun_file.write_all(&pckt)?
                     };
                 }
                 RequestType::ACK => {
-                    hanlde_ack(&packet, &segment);
+                    if let Some(pckt) = handle_ack(&packet, &segment, &mut connections) {
+                        tun_file.write_all(&pckt)?
+                    };
                 }
-                RequestType::Unknown(_) => {
-                    continue;
+                RequestType::PSHACK => {
+                    if let Some(pckt) = handle_pshack(&packet, &segment, &mut connections, &buff) {
+                        tun_file.write_all(&pckt)?
+                    };
                 }
+                _ => {}
             }
-        } else {
-            println!("Packet is {}", packet.protocol);
         }
     }
 
-    Command::new("sudo")
-        .args([
-            "iptables",
-            "-D", // Use -D for Delete
-            "INPUT",
-            "-i",
-            tunif_name,
-            "-p",
-            "tcp",
-            "--tcp-flags",
-            "SYN,RST,ACK,FIN",
-            "SYN",
-            "-j",
-            "DROP",
-        ])
-        .status()?;
-
-    println!("TUN is cleaned up!");
-
-    Ok(())
+    return cleanup(tunif_name);
 }
 
-fn hanlde_syn(
+fn handle_syn(
     packet: &Packet,
     segment: &Segment,
     connections: &mut HashMap<(u32, u16, u32, u16), Connection>,
 ) -> Option<[u8; 40]> {
+    let key = (
+        packet.source_address,
+        segment.source_port,
+        packet.destination_address,
+        segment.destination_port,
+    );
+
+    if connections.contains_key(&key) {
+        return None;
+    }
+
     let isn = 0;
 
     let connection = Connection {
@@ -192,16 +144,7 @@ fn hanlde_syn(
         recv_next: segment.sequence_number + 1,
     };
 
-    if connections.contains_key(&(
-        connection.source_address,
-        connection.source_port,
-        connection.destination_address,
-        connection.destination_port,
-    )) {
-        return None;
-    }
-
-    let tcp_header = match Segment::build(&connection) {
+    let tcp_header = match Segment::build(&connection, RequestType::SYNACK) {
         Ok(header) => header,
         Err(_) => {
             println!("Checksum calc is not done correctly for segment");
@@ -217,19 +160,159 @@ fn hanlde_syn(
         }
     };
 
-    connections.insert(
-        (
-            connection.source_address,
-            connection.source_port,
-            connection.destination_address,
-            connection.destination_port,
-        ),
-        connection,
-    );
+    connections.insert(key, connection);
 
     return Some(ip_packet);
 }
 
-fn hanlde_ack(packet: &Packet, segment: &Segment) {
-    println!("ACK received");
+fn handle_ack(
+    packet: &Packet,
+    segment: &Segment,
+    connections: &mut HashMap<(u32, u16, u32, u16), Connection>,
+) -> Option<[u8; 40]> {
+    let key = (
+        packet.source_address,
+        segment.source_port,
+        packet.destination_address,
+        segment.destination_port,
+    );
+
+    if let Some(connection) = connections.get_mut(&key) {
+        match connection.state {
+            State::SynRcvd => {
+                if segment.acknowledgement_number == connection.send_next {
+                    println!("Connection ESTABLISHED!");
+                    connection.state = State::Established;
+                } else {
+                    println!("Received ACK with wrong number for a connection in SYN_RCVD.");
+                }
+            }
+            State::Established => {
+                println!("Established connection is sending an ack");
+                //we will send some packet here
+            }
+            _ => {}
+        }
+    }
+    return None;
+}
+
+fn handle_pshack(
+    packet: &Packet,
+    segment: &Segment,
+    connections: &mut HashMap<(u32, u16, u32, u16), Connection>,
+    buff: &[u8; 2000],
+) -> Option<[u8; 40]> {
+    let key = (
+        packet.source_address,
+        segment.source_port,
+        packet.destination_address,
+        segment.destination_port,
+    );
+
+    if let Some(connection) = connections.get_mut(&key) {
+        match connection.state {
+            State::Established => {
+                if segment.sequence_number == connection.recv_next {
+                    let tcp_header_length = segment.data_offset * 4;
+                    let total_header_length = (packet.ihl * 4) + tcp_header_length;
+                    let data_length = packet.total_length as usize - total_header_length as usize;
+
+                    if data_length > 0 {
+                        let payload_start = total_header_length as usize;
+                        let payload_end = payload_start + data_length;
+                        let payload = &buff[payload_start..payload_end];
+                        println!("Received Data: {}", String::from_utf8_lossy(payload));
+                    }
+
+                    connection.recv_next += data_length as u32;
+                    connection.send_next += 1;
+
+                    let tcp_header = match Segment::build(&connection, RequestType::ACK) {
+                        Ok(header) => header,
+                        Err(_) => {
+                            println!("Checksum calc is not done correctly for segment");
+                            return None;
+                        }
+                    };
+
+                    let ip_packet = match Packet::build(tcp_header, &connection) {
+                        Ok(packet) => packet,
+                        Err(_) => {
+                            println!("Checksum calc is not done correctly for packet");
+                            return None;
+                        }
+                    };
+
+                    return Some(ip_packet);
+                }
+            }
+            _ => {}
+        }
+    }
+    return None;
+}
+
+fn configure(name: &'static str, address: &'static str) -> io::Result<()> {
+    Command::new("sudo")
+        .args([
+            "iptables",
+            "-I",
+            "INPUT",
+            "1",
+            "-i",
+            name,
+            "-p",
+            "tcp",
+            "--tcp-flags",
+            "SYN,RST,ACK,FIN",
+            "SYN",
+            "-j",
+            "DROP",
+        ])
+        .status()?;
+
+    Command::new("sudo")
+        .args([
+            "sysctl",
+            "-w",
+            &format!("net.ipv6.conf.{}.disable_ipv6=1", name),
+        ])
+        .stdout(Stdio::null())
+        .status()?;
+
+    Command::new("sudo")
+        .args(["ip", "link", "set", "dev", name, "up"])
+        .status()?;
+
+    Command::new("sudo")
+        .args(["ip", "addr", "add", address, "dev", name])
+        .status()?;
+
+    println!("TUN is set up!");
+
+    Ok(())
+}
+
+fn cleanup(name: &'static str) -> io::Result<()> {
+    Command::new("sudo")
+        .args([
+            "iptables",
+            "-D",
+            "INPUT",
+            "-i",
+            name,
+            "-p",
+            "tcp",
+            "--tcp-flags",
+            "SYN,RST,ACK,FIN",
+            "SYN",
+            "-j",
+            "DROP",
+        ])
+        .status()?;
+
+    println!("TUN is cleaned up!");
+
+    Ok(())
 }
